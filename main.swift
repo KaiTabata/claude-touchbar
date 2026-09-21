@@ -6,6 +6,8 @@
 // Tapping it opens the list view: rate limits, one cell per live Claude Code session,
 // and the remote-control status pinned to the right end.
 // Tapping a session brings its Terminal tab to the front and switches to that session's detail view.
+// Tapping a detail cell explains it (in Japanese) and offers related slash commands, which are typed
+// into that session's Terminal tab.
 // While a Terminal tab running Claude Code is frontmost, the bar follows it automatically.
 // While an app listed in apps.txt (Safari, Chrome, ...) is frontmost, the list view replaces that app's Touch Bar.
 //
@@ -240,7 +242,14 @@ struct Row: Equatable {
     var state = "-"     // busy | idle | hot | on | off | -
     var l1 = ""
     var l2 = ""
-    var pid = 0         // > 0 makes the cell tappable
+    var pid = 0         // > 0: tapping opens that session (list view)
+    var key = ""        // non-empty: tapping opens the explanation for this cell (detail view)
+}
+
+/// A slash command offered in the info view. `confirm` asks for a second tap.
+struct Action: Equatable {
+    let command: String
+    var confirm = false
 }
 
 struct Render: Equatable {
@@ -248,6 +257,7 @@ struct Render: Equatable {
     var trayState = "idle"
     var usage = Row()
     var cells: [Row] = []
+    var actions: [Action] = []
     var rc = Row()
 }
 
@@ -262,6 +272,7 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
     } else {
         out.usage.l1 = "5h --"; out.usage.l2 = "7d --"
     }
+    out.usage.key = "usage"
     if snap.sessions.contains(where: { $0.busy }) { out.trayState = "busy" }
     if (snap.five ?? 0) >= 90 { out.trayState = "hot" }
 
@@ -291,49 +302,123 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
         }
         let path = s.dir.hasPrefix(home) ? "~" + s.dir.dropFirst(home.count) : s.dir
         out.cells.append(Row(state: s.busy ? "busy" : "idle", l1: truncateHead(path, 34),
-                             l2: (s.busy ? "RUN " : "IDLE ") + fmtDur(now - s.since) + " · pid \(s.pid) · \(s.tty ?? "?")"))
+                             l2: (s.busy ? "RUN " : "IDLE ") + fmtDur(now - s.since) + " · pid \(s.pid) · \(s.tty ?? "?")", key: "path"))
 
-        for job in s.shells {
-            out.cells.append(Row(state: "busy", l1: "$ " + truncate(job.command, 36), l2: "shell · \(fmtDur(job.seconds))"))
+        for (i, job) in s.shells.enumerated() {
+            out.cells.append(Row(state: "busy", l1: "$ " + truncate(job.command, 36), l2: "shell · \(fmtDur(job.seconds))", key: "shell\(i)"))
         }
 
         if s.state.isEmpty {
-            out.cells.append(Row(l1: "no statusline data yet", l2: "send a prompt in that session"))
+            out.cells.append(Row(l1: "no statusline data yet", l2: "send a prompt in that session", key: "nostate"))
         } else {
             let st = s.state
             if !s.branch.isEmpty {
-                out.cells.append(Row(l1: "⎇ \(s.branch)", l2: s.title.isEmpty ? "untitled" : truncate(s.title, 30)))
+                out.cells.append(Row(l1: "⎇ \(s.branch)", l2: s.title.isEmpty ? "untitled" : truncate(s.title, 30), key: "branch"))
             } else if !s.title.isEmpty {
-                out.cells.append(Row(l1: truncate(s.title, 30), l2: "no git repo · /rename to change"))
+                out.cells.append(Row(l1: truncate(s.title, 30), l2: "no git repo · /rename to change", key: "branch"))
             }
 
             let cw = st.dict("context_window"), cu = cw.dict("current_usage")
             let used = cu.int("input_tokens") + cu.int("cache_creation_input_tokens") + cu.int("cache_read_input_tokens")
             let ctx = s.ctx ?? 0
             out.cells.append(Row(state: ctx >= 80 ? "hot" : "-", l1: "ctx \(ctx)%",
-                                 l2: "\(fmtTok(used)) / \(fmtTok(cw.int("context_window_size"))) tok"))
+                                 l2: "\(fmtTok(used)) / \(fmtTok(cw.int("context_window_size"))) tok", key: "ctx"))
 
-            out.cells.append(Row(l1: s.model, l2: "effort \(st.dict("effort").str("level")) · fast \(st.bool("fast_mode") ? "on" : "off") · think \(st.dict("thinking").bool("enabled") ? "on" : "off")"))
+            out.cells.append(Row(l1: s.model, l2: "effort \(st.dict("effort").str("level")) · fast \(st.bool("fast_mode") ? "on" : "off") · think \(st.dict("thinking").bool("enabled") ? "on" : "off")", key: "model"))
 
             let cost = st.dict("cost")
-            out.cells.append(Row(l1: "+\(cost.int("total_lines_added")) −\(cost.int("total_lines_removed"))", l2: "lines changed"))
+            out.cells.append(Row(l1: "+\(cost.int("total_lines_added")) −\(cost.int("total_lines_removed"))", l2: "lines changed", key: "lines"))
             out.cells.append(Row(l1: "up \(fmtDur(cost.int("total_duration_ms") / 1000))",
-                                 l2: "api \(fmtDur(cost.int("total_api_duration_ms") / 1000)) · $\(String(format: "%.2f", cost.dbl("total_cost_usd")))"))
+                                 l2: "api \(fmtDur(cost.int("total_api_duration_ms") / 1000)) · $\(String(format: "%.2f", cost.dbl("total_cost_usd")))", key: "cost"))
 
             let pc = st.dict("prompt_cache")
             let exp = pc.int("expires_at")
             out.cells.append(Row(state: exp > now ? "-" : "hot",
                                  l1: exp > now ? "cache warm \(fmtDur(exp - now))" : "cache cold",
-                                 l2: "hit \(Int((pc.dbl("hit_ratio") * 100).rounded()))% · \(pc.int("requests")) req"))
+                                 l2: "hit \(Int((pc.dbl("hit_ratio") * 100).rounded()))% · \(pc.int("requests")) req", key: "cache"))
 
-            out.cells.append(Row(l1: "v" + st.str("version"), l2: String(st.str("session_id").prefix(8))))
+            out.cells.append(Row(l1: "v" + st.str("version"), l2: String(st.str("session_id").prefix(8)), key: "version"))
         }
 
         out.rc = s.bridge.isEmpty
             ? Row(state: "off", l1: "remote-control", l2: "off")
             : Row(state: "on", l1: "remote-control", l2: "on · " + truncate(s.bridge, 17))
+
+    case .info(let pid, let key):
+        let base = render(snap, mode: pid > 0 ? .detail(pid) : .list)
+        out.rc = base.rc
+        let session = snap.sessions.first { $0.pid == pid }
+        let shellIndex = key.hasPrefix("shell") ? Int(key.dropFirst(5)) : nil
+        let job = shellIndex.flatMap { i in session.flatMap { i < $0.shells.count ? $0.shells[i] : nil } }
+        let help = helpText(for: key, shell: job)
+
+        var live: Row? = key == "usage" ? base.usage : key == "rc" ? base.rc : base.cells.first { $0.key == key }
+        live?.key = ""
+        if let live = live { out.cells.append(live) }
+        out.cells.append(Row(state: "jp", l1: help.l1, l2: help.l2))
+        out.actions = session == nil ? [] : help.actions
     }
+    out.rc.key = "rc"
     return out
+}
+
+// ── explanations shown when a detail cell is tapped ─────
+
+struct Help {
+    let l1: String
+    let l2: String
+    var actions: [Action] = []
+}
+
+func helpText(for key: String, shell: ShellJob?) -> Help {
+    if key.hasPrefix("shell") {
+        return Help(l1: "$ " + truncate(shell?.command ?? "（終了しました）", 70),
+                    l2: "Claude が Bash ツールで実行中のコマンドです。長く動いているものは、バックグラウンド実行か終了待ちのループです。")
+    }
+    switch key {
+    case "path":
+        return Help(l1: "作業ディレクトリです。Claude はここを基準にファイルを読み書きします。",
+                    l2: "RUN=応答を生成中 / IDLE=入力待ち。pid と tty はこのセッションのプロセス番号と端末です。",
+                    actions: [Action(command: "/status")])
+    case "branch":
+        return Help(l1: "⎇ は git ブランチです。* は未コミットの変更があることを示します。",
+                    l2: "もう一方はセッション名です。ターミナルで「/rename 新しい名前」と入力すると変更できます。")
+    case "ctx":
+        return Help(l1: "コンテキスト使用量です。会話・読んだファイル・ツール結果の合計で、80% を超えると赤くなります。",
+                    l2: "上限に近づくと自動で要約されます。/context で内訳を表示、/compact で今すぐ要約します。",
+                    actions: [Action(command: "/context"), Action(command: "/compact", confirm: true)])
+    case "model":
+        return Help(l1: "使用中のモデルです。effort=考える深さ / fast=高速出力モード / think=拡張思考。",
+                    l2: "/model でモデルを選び直し、/fast で高速モードを切り替え、/config で設定全般を開きます。",
+                    actions: [Action(command: "/model"), Action(command: "/fast"), Action(command: "/config")])
+    case "lines":
+        return Help(l1: "このセッションで Claude が追加した行数（+）と削除した行数（−）です。",
+                    l2: "セッション開始からの累計です。")
+    case "cost":
+        return Help(l1: "up=セッション開始からの経過時間 / api=API の応答を待っていた時間の合計です。",
+                    l2: "$ は API 料金に換算した目安で、サブスクリプションでは実際の請求額ではありません。/usage で枠の使用状況を確認できます。",
+                    actions: [Action(command: "/usage")])
+    case "cache":
+        return Help(l1: "プロンプトキャッシュです。warm の間は会話の読み直しが安く速く済みます。hit はキャッシュ命中率です。",
+                    l2: "残り時間が切れて cold になると、次の発言で会話全体を読み直すため、使用量を多めに消費します。")
+    case "version":
+        return Help(l1: "Claude Code のバージョンと、セッション ID の先頭 8 桁です。",
+                    l2: "「claude -r」でこの会話を後から再開できます。/status でバージョンやアカウントの状態を確認できます。",
+                    actions: [Action(command: "/status")])
+    case "usage":
+        return Help(l1: "5h=5 時間枠 / 7d=週間枠の使用率です。↻ はリセットまでの残り時間です。",
+                    l2: "5h が 90% 以上になると Control Strip の数字が赤くなります。/usage で詳しい内訳を確認できます。",
+                    actions: [Action(command: "/usage")])
+    case "rc":
+        return Help(l1: "Remote Control です。on のセッションは claude.ai やスマホアプリから続きを操作できます。",
+                    l2: "/remote-control で、このセッションの Remote Control を開始します。",
+                    actions: [Action(command: "/remote-control")])
+    case "nostate":
+        return Help(l1: "このセッションはまだ statusline のデータを書き出していません。",
+                    l2: "そのセッションで一度メッセージを送ると、コンテキストやモデルなどが表示されます。")
+    default:
+        return Help(l1: "", l2: "")
+    }
 }
 
 // ── drawing ─────────────────────────────────────────────
@@ -356,6 +441,10 @@ func twoLines(_ row: Row, alignment: NSTextAlignment = .left) -> NSAttributedStr
     let para = NSMutableParagraphStyle()
     para.maximumLineHeight = 13
     para.alignment = alignment
+    if row.state == "jp" {
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor(white: 0.88, alpha: 1), .paragraphStyle: para]
+        return NSAttributedString(string: row.l1 + "\n" + row.l2, attributes: attrs)
+    }
     let dot = color(for: row.state)
     let out = NSMutableAttributedString()
     if let dot = dot {
@@ -371,6 +460,12 @@ func twoLines(_ row: Row, alignment: NSTextAlignment = .left) -> NSAttributedStr
 /// Two-line text cell. Tappable when `pid` is set.
 final class Cell: NSTextField {
     var pid = 0
+    var key = ""
+}
+
+final class ActionButton: NSButton {
+    var action_: Action?
+    var armed = false
 }
 
 func makeCell() -> Cell {
@@ -385,12 +480,14 @@ extension NSTouchBarItem.Identifier {
     static let tray = NSTouchBarItem.Identifier("space.tabataba.claude-touchbar.tray")
     static let lead = NSTouchBarItem.Identifier("space.tabataba.claude-touchbar.lead")
     static let cells = NSTouchBarItem.Identifier("space.tabataba.claude-touchbar.cells")
+    static let actions = NSTouchBarItem.Identifier("space.tabataba.claude-touchbar.actions")
     static let rc = NSTouchBarItem.Identifier("space.tabataba.claude-touchbar.rc")
 }
 
 enum Mode: Equatable {
     case list
     case detail(Int)
+    case info(Int, String)   // pid (0 = no session) and the Row.key being explained
 }
 
 // ── Terminal.app via in-process AppleScript (needs the one-time Automation permission) ──
@@ -422,6 +519,29 @@ final class TerminalBridge {
                 self.inFlight = false
                 done((tty ?? "").isEmpty ? nil : tty)
             }
+        }
+    }
+
+    /// Types a slash command into the tab (Terminal's `do script ... in tab` sends the text plus return).
+    func send(_ command: String, toTTY tty: String) {
+        guard tty.range(of: "^ttys[0-9]+$", options: .regularExpression) != nil,
+              command.range(of: "^/[a-z-]+$", options: .regularExpression) != nil else { return }
+        queue.async {
+            let script = NSAppleScript(source: """
+                tell application "Terminal"
+                    repeat with w in windows
+                        repeat with t in tabs of w
+                            if tty of t is "/dev/\(tty)" then
+                                do script "\(command)" in t
+                                return
+                            end if
+                        end repeat
+                    end repeat
+                end tell
+                """)
+            var err: NSDictionary?
+            script?.executeAndReturnError(&err)
+            if let err = err { log("send failed: \(err[NSAppleScript.errorMessage] ?? err)") } else { log("sent \(command) to \(tty)") }
         }
     }
 
@@ -459,6 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     var backButton: NSButton!
     let leadStack = NSStackView()
     let cellStack = NSStackView()
+    let actionStack = NSStackView()
     let rcCell = makeCell()
     var bar: NSTouchBar!
     var visibleObservation: NSKeyValueObservation?
@@ -503,10 +624,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         cellStack.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
 
         rcCell.setContentHuggingPriority(.required, for: .horizontal)
+        actionStack.orientation = .horizontal
+        actionStack.spacing = 6
+        for cell in [usageCell, rcCell] {
+            let tap = NSClickGestureRecognizer(target: self, action: #selector(cellTapped(_:)))
+            tap.allowedTouchTypes = .direct
+            cell.addGestureRecognizer(tap)
+        }
 
         bar = NSTouchBar()
         bar.delegate = self
-        bar.defaultItemIdentifiers = [.lead, .cells, .rc]
+        bar.defaultItemIdentifiers = [.lead, .cells, .actions, .rc]
 
         installTray()
         refresh()
@@ -563,6 +691,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
                 cellStack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             ])
             item.view = scroll
+        case .actions:
+            item.view = actionStack
         case .rc:
             item.view = rcCell
         default:
@@ -627,14 +757,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         }
     }
 
+    /// info -> detail -> list
     @objc func backToList() {
-        setMode(.list)
+        if case .info(let pid, _) = mode, pid > 0 { setMode(.detail(pid)) } else { setMode(.list) }
+    }
+
+    var modePid: Int {
+        switch mode {
+        case .list: return 0
+        case .detail(let pid), .info(let pid, _): return pid
+        }
     }
 
     @objc func cellTapped(_ g: NSGestureRecognizer) {
-        guard let cell = g.view as? Cell, cell.pid > 0 else { return }
-        setMode(.detail(cell.pid))
-        if let tty = ttyName(of: pid_t(cell.pid)) { terminal.focus(tty: tty) }
+        guard let cell = g.view as? Cell else { return }
+        if cell.pid > 0 {
+            setMode(.detail(cell.pid))
+            if let tty = ttyName(of: pid_t(cell.pid)) { terminal.focus(tty: tty) }
+        } else if !cell.key.isEmpty {
+            if case .info = mode { return }
+            setMode(.info(modePid, cell.key))
+        }
+    }
+
+    @objc func actionTapped(_ b: ActionButton) {
+        guard let a = b.action_, modePid > 0, let tty = ttyName(of: pid_t(modePid)) else { return }
+        if a.confirm && !b.armed {
+            b.armed = true
+            b.attributedTitle = NSAttributedString(string: "run \(a.command) ?", attributes: [.font: line1Font, .foregroundColor: NSColor.systemOrange])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak b] in
+                guard let b = b, b.armed else { return }
+                b.armed = false
+                b.attributedTitle = NSAttributedString(string: a.command, attributes: [.font: line1Font])
+            }
+            return
+        }
+        terminal.send(a.command, toTTY: tty)
+        terminal.focus(tty: tty)
+        setMode(.detail(modePid))
     }
 
     func setMode(_ m: Mode) {
@@ -709,9 +869,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     }
 
     func apply(_ r: Render) {
-        let isDetail = mode != .list
-        backButton.isHidden = !isDetail
-        usageCell.isHidden = isDetail
+        let isList = mode == .list
+        backButton.isHidden = isList
+        usageCell.isHidden = !isList
+        if case .info = mode { backButton.title = "‹ back" } else { backButton.title = "‹ all" }
+        usageCell.key = r.usage.key
+        rcCell.key = r.rc.key
+
+        if r.actions != last.actions {
+            for v in actionStack.arrangedSubviews {
+                actionStack.removeArrangedSubview(v)
+                v.removeFromSuperview()
+            }
+            for a in r.actions {
+                let b = ActionButton(title: a.command, target: self, action: #selector(actionTapped(_:)))
+                b.font = line1Font
+                b.action_ = a
+                actionStack.addArrangedSubview(b)
+            }
+        }
 
         if r.trayText != last.trayText || r.trayState != last.trayState || trayButton.title == "cc" {
             trayButton.attributedTitle = NSAttributedString(string: r.trayText, attributes: [
@@ -739,6 +915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
             for (i, row) in r.cells.enumerated() {
                 let c = cellStack.arrangedSubviews[i] as! Cell
                 c.pid = row.pid
+                c.key = row.key
                 c.attributedStringValue = twoLines(row)
             }
         }

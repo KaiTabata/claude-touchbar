@@ -18,6 +18,9 @@ Detail view:     ‹ all   ● ~/src/my-app            ● $ npm run dev    ⎇ 
 - **Detail view** – tap a session to bring its Terminal tab to the front and see everything about it:
   path, pid/tty, running Bash-tool commands, context tokens, model/effort/fast/thinking, lines changed,
   uptime/API time/cost, prompt-cache TTL and hit rate, version, remote-control status.
+- **Explains itself** – tap any detail cell for an explanation (in Japanese) plus related slash commands
+  (`/model`, `/fast`, `/config`, `/context`, `/compact`, `/usage`, `/status`, `/remote-control`). Tapping a command types it
+  into that session's Terminal tab; `/compact` asks for a second tap.
 - **Follows you** – while a Terminal tab running Claude Code is frontmost, the bar shows that session automatically.
 - **Replaces other apps' Touch Bars** – while an app listed in `apps.txt` (Safari and Chrome by default) is frontmost,
   the list view is shown instead of that app's controls. Edit the file to add or remove apps; no rebuild needed.
