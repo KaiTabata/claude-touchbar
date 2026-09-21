@@ -198,7 +198,7 @@ final class KeepAwake {
     private var retryAt = Date.distantPast
     var onChange: (() -> Void)?
 
-    /// Returns what the remote-control cell shows: "awake", "batt low", "awake ✗" or "".
+    /// Returns what the remote-control cell shows: "awake", "batt" (low battery), "sudo✗" or "".
     func update(rcOn: Bool) -> String {
         lock.lock(); defer { lock.unlock() }
         guard !quitting else { return "" }
@@ -207,8 +207,8 @@ final class KeepAwake {
         let actual = sleepDisabled()
         if want != actual { set(want) }
         if actual { return "awake" }
-        if low { return "batt low" }
-        return want && failed ? "awake ✗" : ""
+        if low { return "batt" }
+        return want && failed ? "sudo✗" : ""
     }
 
     private func set(_ on: Bool) {
@@ -404,7 +404,7 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
         guard let s = snap.sessions.first(where: { $0.pid == pid }) else {
             out.cells = [Row(l1: "session ended", l2: "pid \(pid)")]
             out.rc = rcOn > 0
-                ? Row(state: "held", l1: "remote-control", l2: "\(rcOn) other on")
+                ? Row(state: "held", l1: "remote-control", l2: "+\(rcOn)")
                 : Row(state: "off", l1: "remote-control", l2: "off")
             break
         }
@@ -448,11 +448,12 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
             out.cells.append(Row(l1: "v" + st.str("version"), l2: String(st.str("session_id").prefix(8)), key: "version"))
         }
 
-        // off here, but another session's remote-control still keeps the Mac awake
+        // l2 plus the keep-awake tail has to stay within the width of "● remote-control" (17 chars at this size).
+        // "off · +1": off here, but another session's remote-control still keeps the Mac awake
         if !s.bridge.isEmpty {
-            out.rc = Row(state: "on", l1: "remote-control", l2: "on · " + truncate(s.bridge, 12))
+            out.rc = Row(state: "on", l1: "remote-control", l2: snap.awake.isEmpty ? "on · " + truncate(s.bridge, 12) : "on")
         } else if rcOn > 0 {
-            out.rc = Row(state: "held", l1: "remote-control", l2: "off · \(rcOn) other on")
+            out.rc = Row(state: "held", l1: "remote-control", l2: "off · +\(rcOn)")
         } else {
             out.rc = Row(state: "off", l1: "remote-control", l2: "off")
         }
@@ -525,7 +526,7 @@ func helpText(for key: String, shell: ShellJob?) -> Help {
                     actions: [Action(command: "/usage")])
     case "rc":
         return Help(l1: "Remote Control です。on のセッションは claude.ai やスマホアプリから続きを操作できます。/remote-control で開始します。",
-                    l2: "on のセッションが 1 つでもある間は、蓋を閉じてもスリープしません（awake・青緑の点）。電池 15% 以下では解除します。",
+                    l2: "on のセッションが 1 つでもある間は、蓋を閉じてもスリープしません（awake・青緑の点）。「off · +1」は他の 1 セッションが on の意味です。電池 15% 以下では解除します。",
                     actions: [Action(command: "/remote-control")])
     case "nostate":
         return Help(l1: "このセッションはまだ statusline のデータを書き出していません。",

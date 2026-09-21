@@ -31,8 +31,8 @@ Control Strip:   26%        緑 = アイドル · オレンジ = 実行中のセ
 - **remote-control 中はスリープしない** – remote-control が on のセッションが1つでもあるあいだ、`pmset disablesleep 1` で
   システムのスリープを止めます（蓋を閉じても動き続けるので、外出先のスマホから続きを操作できます）。全部 off になるか
   セッションが終われば元に戻ります。有効なあいだは Control Strip に青緑の点、remote-control セルに `awake` が出ます。
-  いま見ているセッションが off でも、他のセッションが on なら `off · 1 other on · awake` のように理由がわかる表示になります。
-  バッテリー駆動で残量 15% 以下になったら解除します（`batt low`）。アプリ終了時も必ず元に戻します。
+  いま見ているセッションが off でも、他のセッションが on なら青緑の点と `off · +1 · awake`（他に 1 セッションが on）で理由がわかります。
+  バッテリー駆動で残量 15% 以下になったら解除します（`batt`）。アプリ終了時も必ず元に戻します。
   この設定はアプリが完全に管理します：on のセッションがなければ、手動で `pmset disablesleep 1` にしていても 0 に戻します
   （戻し忘れたままカバンの中で動き続ける事故を防ぐため）。
   以前は [Capsomnia](https://github.com/fuji-mak/capsomnia)（Caps Lock 連動）でやっていたことの置き換えです。
@@ -62,7 +62,7 @@ cd ~/.config/claude-touchbar
 
 `install-awake.sh` は `/etc/sudoers.d/claude-touchbar` を作り、`pmset -a disablesleep 0` と `pmset -a disablesleep 1` の
 2コマンドだけをパスワードなしの sudo で実行できるようにします（この設定の変更には root が必要なため）。入れなければ
-スリープ禁止は働かず、remote-control セルに `awake ✗` と出るだけです。
+スリープ禁止は働かず、remote-control セルに `sudo✗` と出るだけです。
 
 そのあと `statusline-snippet.sh` の中身を自分の statusline スクリプトに貼り付けます。Claude Code がコンテキスト・モデル・
 コスト・レート制限のデータを渡してくれるのは statusline だけなので、アプリはそこ経由でデータを受け取ります。
