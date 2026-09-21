@@ -9,7 +9,7 @@
 // Tapping a detail cell explains it (in Japanese) and offers related slash commands, which are typed
 // into that session's Terminal tab.
 // While a Terminal tab running Claude Code is frontmost, the bar follows it automatically.
-// While an app listed in apps.txt (Safari, Chrome, ...) is frontmost, the list view replaces that app's Touch Bar.
+// While an app listed in apps.txt (Safari, Chrome, Finder, ...) is frontmost, the list view replaces that app's Touch Bar.
 //
 // Designed to cost nothing when idle: no child processes, no network. It reads a few small JSON
 // files and asks the kernel for process info, every 2s while the bar is visible or Terminal is

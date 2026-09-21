@@ -3,3 +3,4 @@
 # Edits apply the next time you switch apps; no rebuild needed.
 com.apple.Safari
 com.google.Chrome
+com.apple.finder
