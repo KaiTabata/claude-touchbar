@@ -10,10 +10,12 @@
 // into that session's Terminal tab.
 // While a Terminal tab running Claude Code is frontmost, the bar follows it automatically.
 // While an app listed in apps.txt (Safari, Chrome, Finder, ...) is frontmost, the list view replaces that app's Touch Bar.
+// While any session has remote-control on, system sleep is disabled (lid closed included) so the
+// session stays reachable; a teal dot / "awake" marks it. Needs the sudoers rule from install-awake.sh.
 //
-// Designed to cost nothing when idle: no child processes, no network. It reads a few small JSON
-// files and asks the kernel for process info, every 2s while the bar is visible or Terminal is
-// in front, every 10s otherwise.
+// Designed to cost nothing when idle: no network, and no child processes except one `pmset` call
+// when keep-awake flips. It reads a few small JSON files and asks the kernel for process info,
+// every 2s while the bar is visible or Terminal is in front, every 10s otherwise.
 //
 // Inputs:
 //   ~/.claude/sessions/<pid>.json            written by Claude Code (pid, status, cwd, bridgeSessionId)
@@ -24,6 +26,8 @@
 // DFRFoundation / NSTouchBar calls. A macOS update may break it; see touchbar.log.
 
 import AppKit
+import IOKit
+import IOKit.ps
 
 let home = NSHomeDirectory()
 let sessionsDir = home + "/.claude/sessions"
@@ -31,6 +35,7 @@ let stateDir = home + "/.claude/cache/touchbar"
 let usageFile = home + "/.claude/cache/usage-latest.json"
 let logPath = home + "/.config/claude-touchbar/touchbar.log"
 let appsFile = home + "/.config/claude-touchbar/apps.txt"
+let awakeMarker = home + "/.config/claude-touchbar/awake.on"
 
 /// Bundle ids whose own Touch Bar gets replaced by the list view. One per line, # for comments.
 func loadListApps() -> Set<String> {
@@ -157,6 +162,100 @@ func shellJobs(of pid: pid_t, in procs: [kinfo_proc], now: Int) -> [ShellJob] {
     return jobs.sorted { $0.seconds > $1.seconds }
 }
 
+// ── keep awake while remote-control is on ───────────────
+
+/// `pmset disablesleep`, as the kernel sees it. Unlike a power assertion it also survives closing the lid.
+func sleepDisabled() -> Bool {
+    let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    guard root != 0 else { return false }
+    defer { IOObjectRelease(root) }
+    let v = IORegistryEntryCreateCFProperty(root, "SleepDisabled" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+    return (v as? Bool) ?? false
+}
+
+/// On battery at 15% or less: not worth draining a closed laptop to zero.
+func batteryLow() -> Bool {
+    let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+    guard (IOPSGetProvidingPowerSourceType(info).takeUnretainedValue() as String) == kIOPMBatteryPowerKey else { return false }
+    for ps in IOPSCopyPowerSourcesList(info).takeRetainedValue() as [CFTypeRef] {
+        if let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
+           let pct = d[kIOPSCurrentCapacityKey] as? Int {
+            return pct <= 15
+        }
+    }
+    return false
+}
+
+/// Disables system sleep while some session has remote-control on. The setting needs root, so it goes
+/// through `sudo -n pmset` (see install-awake.sh); that is the only child process this app starts, and
+/// only when the state flips. The marker file records that the setting is ours, so a crash gets cleaned
+/// up on the next start and a `disablesleep 1` set by someone else is left alone.
+final class KeepAwake {
+    private let lock = NSLock()
+    private var inFlight = false
+    private var failed = false
+    private var retryAt = Date.distantPast
+    var onChange: (() -> Void)?
+
+    /// Returns what the remote-control cell shows: "awake", "batt low", "awake ✗" or "".
+    func update(rcOn: Bool) -> String {
+        lock.lock(); defer { lock.unlock() }
+        let low = rcOn && batteryLow()
+        let want = rcOn && !low
+        let actual = sleepDisabled()
+        let ours = FileManager.default.fileExists(atPath: awakeMarker)
+        if want && !actual {
+            set(true)
+        } else if !want && ours {
+            if actual { set(false) } else { try? FileManager.default.removeItem(atPath: awakeMarker) }
+        }
+        if actual { return "awake" }
+        if low { return "batt low" }
+        return want && failed ? "awake ✗" : ""
+    }
+
+    private func set(_ on: Bool) {
+        guard !inFlight, Date() >= retryAt else { return }
+        inFlight = true
+        if on { FileManager.default.createFile(atPath: awakeMarker, contents: nil) }
+        DispatchQueue.global(qos: .utility).async {
+            let ok = KeepAwake.pmset(on)
+            self.lock.lock()
+            self.inFlight = false
+            if ok {
+                log("keep-awake \(on ? "on" : "off")")
+                if !on { try? FileManager.default.removeItem(atPath: awakeMarker) }
+            } else if !self.failed {
+                log("keep-awake: sudo pmset failed; run ./install-awake.sh")
+            }
+            self.failed = !ok
+            self.retryAt = ok ? .distantPast : Date().addingTimeInterval(60)
+            self.lock.unlock()
+            DispatchQueue.main.async { self.onChange?() }
+        }
+    }
+
+    static func pmset(_ on: Bool) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        p.arguments = ["-n", "/usr/bin/pmset", "-a", "disablesleep", on ? "1" : "0"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    /// On quit (launchd sends SIGTERM): `disablesleep` persists across reboots, so never leave ours behind.
+    func restoreForExit() {
+        guard FileManager.default.fileExists(atPath: awakeMarker) else { return }
+        if !sleepDisabled() || KeepAwake.pmset(false) {
+            try? FileManager.default.removeItem(atPath: awakeMarker)
+            log("keep-awake off (quit)")
+        }
+    }
+}
+
 // ── data model ──────────────────────────────────────────
 
 func readJSON(_ path: String) -> [String: Any]? {
@@ -204,6 +303,7 @@ struct Snapshot {
     var week = 0
     var weekReset = 0
     var sessions: [Session] = []
+    var awake = ""              // KeepAwake.update's label
 }
 
 func loadSnapshot(withShells: Bool) -> Snapshot {
@@ -250,6 +350,7 @@ struct Row: Equatable {
     var l2 = ""
     var pid = 0         // > 0: tapping opens that session (list view)
     var key = ""        // non-empty: tapping opens the explanation for this cell (detail view)
+    var tail = ""       // keep-awake note after l2: teal for "awake", red for a problem
 }
 
 /// A slash command offered in the info view. `confirm` asks for a second tap.
@@ -261,6 +362,7 @@ struct Action: Equatable {
 struct Render: Equatable {
     var trayText = "cc"
     var trayState = "idle"
+    var trayAwake = false
     var usage = Row()
     var cells: [Row] = []
     var actions: [Action] = []
@@ -281,6 +383,8 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
     out.usage.key = "usage"
     if snap.sessions.contains(where: { $0.busy }) { out.trayState = "busy" }
     if (snap.five ?? 0) >= 90 { out.trayState = "hot" }
+    out.trayAwake = snap.awake == "awake"
+    let rcOn = snap.sessions.filter { !$0.bridge.isEmpty }.count
 
     switch mode {
     case .list:
@@ -295,15 +399,16 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
             out.cells.append(Row(state: s.busy ? "busy" : "idle", l1: l1, l2: l2, pid: s.pid))
         }
         if out.cells.isEmpty { out.cells = [Row(l1: "no sessions", l2: "claude is not running")] }
-        let on = snap.sessions.filter { !$0.bridge.isEmpty }.count
-        out.rc = on > 0
-            ? Row(state: "on", l1: "remote-control", l2: "\(on)/\(snap.sessions.count) on")
+        out.rc = rcOn > 0
+            ? Row(state: "on", l1: "remote-control", l2: "\(rcOn)/\(snap.sessions.count) on")
             : Row(state: "off", l1: "remote-control", l2: "off")
 
     case .detail(let pid):
         guard let s = snap.sessions.first(where: { $0.pid == pid }) else {
             out.cells = [Row(l1: "session ended", l2: "pid \(pid)")]
-            out.rc = Row(state: "off", l1: "remote-control", l2: "off")
+            out.rc = rcOn > 0
+                ? Row(state: "held", l1: "remote-control", l2: "\(rcOn) other on")
+                : Row(state: "off", l1: "remote-control", l2: "off")
             break
         }
         let path = s.dir.hasPrefix(home) ? "~" + s.dir.dropFirst(home.count) : s.dir
@@ -346,9 +451,14 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
             out.cells.append(Row(l1: "v" + st.str("version"), l2: String(st.str("session_id").prefix(8)), key: "version"))
         }
 
-        out.rc = s.bridge.isEmpty
-            ? Row(state: "off", l1: "remote-control", l2: "off")
-            : Row(state: "on", l1: "remote-control", l2: "on · " + truncate(s.bridge, 17))
+        // off here, but another session's remote-control still keeps the Mac awake
+        if !s.bridge.isEmpty {
+            out.rc = Row(state: "on", l1: "remote-control", l2: "on · " + truncate(s.bridge, 12))
+        } else if rcOn > 0 {
+            out.rc = Row(state: "held", l1: "remote-control", l2: "off · \(rcOn) other on")
+        } else {
+            out.rc = Row(state: "off", l1: "remote-control", l2: "off")
+        }
 
     case .info(let pid, let key):
         let base = render(snap, mode: pid > 0 ? .detail(pid) : .list)
@@ -365,6 +475,7 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
         out.actions = session == nil ? [] : help.actions
     }
     out.rc.key = "rc"
+    if case .info = mode {} else if !snap.awake.isEmpty { out.rc.tail = " · " + snap.awake }
     return out
 }
 
@@ -416,8 +527,8 @@ func helpText(for key: String, shell: ShellJob?) -> Help {
                     l2: "5h が 90% 以上になると Control Strip の数字が赤くなります。/usage で詳しい内訳を確認できます。",
                     actions: [Action(command: "/usage")])
     case "rc":
-        return Help(l1: "Remote Control です。on のセッションは claude.ai やスマホアプリから続きを操作できます。",
-                    l2: "/remote-control で、このセッションの Remote Control を開始します。",
+        return Help(l1: "Remote Control です。on のセッションは claude.ai やスマホアプリから続きを操作できます。/remote-control で開始します。",
+                    l2: "on のセッションが 1 つでもある間は、蓋を閉じてもスリープしません（awake・青緑の点）。電池 15% 以下では解除します。",
                     actions: [Action(command: "/remote-control")])
     case "nostate":
         return Help(l1: "このセッションはまだ statusline のデータを書き出していません。",
@@ -434,6 +545,7 @@ func color(for state: String) -> NSColor? {
     case "busy": return .systemOrange
     case "hot": return .systemRed
     case "idle", "on": return .systemGreen
+    case "held": return awakeColor
     case "off": return NSColor(white: 0.45, alpha: 1)
     default: return nil
     }
@@ -442,6 +554,7 @@ func color(for state: String) -> NSColor? {
 let line1Font = NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
 let line2Font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
 let dimColor = NSColor(white: 0.62, alpha: 1)
+let awakeColor = NSColor.systemTeal
 
 func twoLines(_ row: Row, alignment: NSTextAlignment = .left) -> NSAttributedString {
     let para = NSMutableParagraphStyle()
@@ -459,6 +572,10 @@ func twoLines(_ row: Row, alignment: NSTextAlignment = .left) -> NSAttributedStr
     out.append(NSAttributedString(string: row.l1, attributes: [.font: line1Font, .foregroundColor: NSColor.white]))
     let indent = (dot != nil && alignment == .left) ? "  " : ""
     out.append(NSAttributedString(string: "\n" + indent + row.l2, attributes: [.font: line2Font, .foregroundColor: dimColor]))
+    if !row.tail.isEmpty {
+        let tint = row.tail.hasSuffix("awake") ? awakeColor : NSColor.systemRed
+        out.append(NSAttributedString(string: row.tail, attributes: [.font: line2Font, .foregroundColor: tint]))
+    }
     out.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: out.length))
     return out
 }
@@ -590,6 +707,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     var bar: NSTouchBar!
     var visibleObservation: NSKeyValueObservation?
     let terminal = TerminalBridge()
+    let keepAwake = KeepAwake()
+    var termSource: DispatchSourceSignal?
 
     var mode: Mode = .list
     var last = Render()
@@ -643,6 +762,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         bar.defaultItemIdentifiers = [.lead, .cells, .actions, .rc]
 
         installTray()
+        keepAwake.onChange = { [weak self] in self?.refresh() }
+        signal(SIGTERM, SIG_IGN)
+        termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        termSource?.setEventHandler { [weak self] in
+            self?.keepAwake.restoreForExit()
+            exit(0)
+        }
+        termSource?.resume()
         refresh()
 
         let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
@@ -862,7 +989,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         let visible = forceShells || bar.isVisible
         DispatchQueue.global(qos: .utility).async {
             // the process table is only scanned while someone is looking
-            let snap = loadSnapshot(withShells: visible)
+            var snap = loadSnapshot(withShells: visible)
+            snap.awake = self.keepAwake.update(rcOn: snap.sessions.contains { !$0.bridge.isEmpty })
             var ttys: [String: Int] = [:]
             for s in snap.sessions { if let t = s.tty { ttys[t] = s.pid } }
             let r = render(snap, mode: m)
@@ -895,11 +1023,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
             }
         }
 
-        if r.trayText != last.trayText || r.trayState != last.trayState || trayButton.title == "cc" {
-            trayButton.attributedTitle = NSAttributedString(string: r.trayText, attributes: [
+        if r.trayText != last.trayText || r.trayState != last.trayState || r.trayAwake != last.trayAwake || trayButton.title == "cc" {
+            // the teal dot takes over from Capsomnia's Caps Lock lamp: sleep is disabled right now
+            let title = NSMutableAttributedString(string: r.trayAwake ? "●" : "", attributes: [
+                .font: NSFont.systemFont(ofSize: 7), .foregroundColor: awakeColor, .baselineOffset: 3,
+            ])
+            // the strip clips anything wider than the button, so "●100%" loses its percent sign
+            let text = r.trayAwake && r.trayText.count > 3 ? String(r.trayText.dropLast()) : r.trayText
+            title.append(NSAttributedString(string: text, attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold),
                 .foregroundColor: color(for: r.trayState) ?? .white,
-            ])
+            ]))
+            trayButton.attributedTitle = title
         }
         if r.usage != last.usage { usageCell.attributedStringValue = twoLines(r.usage) }
         if r.rc != last.rc { rcCell.attributedStringValue = twoLines(r.rc, alignment: .right) }

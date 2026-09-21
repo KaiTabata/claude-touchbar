@@ -34,3 +34,4 @@ PLIST_EOF
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed and started $LABEL"
+[ -e /etc/sudoers.d/claude-touchbar ] || echo "keep-awake while remote-control is on is not set up yet: run ./install-awake.sh"
