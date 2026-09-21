@@ -178,6 +178,7 @@ struct Session {
     let since: Int              // epoch seconds of the last status change
     let cwd: String
     let bridge: String          // remote-control session id, empty when off
+    let userName: String        // set by /rename or `claude -n`; written to the session file immediately
     let state: [String: Any]    // statusline snapshot, empty until that session has rendered once
     var shells: [ShellJob] = []
 
@@ -188,7 +189,11 @@ struct Session {
     }
     var name: String { dir == home ? "~" : (dir as NSString).lastPathComponent }
     var branch: String { state.str("tb_branch") }
-    var title: String { state.str("session_name").replacingOccurrences(of: "\n", with: " ") }
+    /// The statusline snapshot only refreshes when that session renders, so a /rename shows up late there.
+    var title: String {
+        let t = userName.isEmpty ? state.str("session_name") : userName
+        return t.replacingOccurrences(of: "\n", with: " ")
+    }
     var ctx: Int? { state["tb_ctx_pct"] == nil ? nil : state.int("tb_ctx_pct") }
     var model: String { shortModel(state.dict("model").str("id")) }
 }
@@ -226,6 +231,7 @@ func loadSnapshot(withShells: Bool) -> Snapshot {
             since: ((sinceMs as? NSNumber)?.intValue ?? 0) / 1000,
             cwd: j.str("cwd"),
             bridge: j.str("bridgeSessionId"),
+            userName: j.str("nameSource") == "user" ? j.str("name") : "",
             state: readJSON(stateDir + "/" + j.str("sessionId") + ".json") ?? [:]
         )
         if withShells { s.shells = shellJobs(of: pid_t(pid), in: procs, now: now) }
