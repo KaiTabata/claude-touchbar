@@ -74,3 +74,7 @@ rm ~/Library/LaunchAgents/space.tabataba.claude-touchbar.plist
   `bridgeSessionId` があればオンとみなします。実行中のシェルコマンドは、claude プロセスの子プロセスのうち引数が
   `~/.claude/shell-snapshots/` を参照しているものです。どれもバージョンが変わると変わる可能性があります。
 - セッションのタイトルは Claude Code のセッション名です。`/rename <name>` で変更するか、`claude -n <name>` で起動します。
+
+## ライセンス
+
+[MIT](LICENSE)
