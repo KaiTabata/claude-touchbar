@@ -32,6 +32,11 @@ cat > "$PLIST" <<PLIST_EOF
 PLIST_EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+# the app restores the sleep setting before it exits; bootstrap fails while the old job is still around
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+    sleep 0.5
+done
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed and started $LABEL"
 [ -e /etc/sudoers.d/claude-touchbar ] || echo "keep-awake while remote-control is on is not set up yet: run ./install-awake.sh"
