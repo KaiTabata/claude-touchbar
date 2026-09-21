@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>space.tabataba.claude-touchbar</string>
+    <key>CFBundleName</key>
+    <string>ClaudeTouchBar</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Finds which Terminal tab is in front and brings a Claude Code session's tab forward when you tap it on the Touch Bar.</string>
+</dict>
+</plist>
