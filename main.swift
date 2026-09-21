@@ -35,7 +35,6 @@ let stateDir = home + "/.claude/cache/touchbar"
 let usageFile = home + "/.claude/cache/usage-latest.json"
 let logPath = home + "/.config/claude-touchbar/touchbar.log"
 let appsFile = home + "/.config/claude-touchbar/apps.txt"
-let awakeMarker = home + "/.config/claude-touchbar/awake.on"
 
 /// Bundle ids whose own Touch Bar gets replaced by the list view. One per line, # for comments.
 func loadListApps() -> Set<String> {
@@ -186,29 +185,27 @@ func batteryLow() -> Bool {
     return false
 }
 
-/// Disables system sleep while some session has remote-control on. The setting needs root, so it goes
-/// through `sudo -n pmset` (see install-awake.sh); that is the only child process this app starts, and
-/// only when the state flips. The marker file records that the setting is ours, so a crash gets cleaned
-/// up on the next start and a `disablesleep 1` set by someone else is left alone.
+/// Disables system sleep while some session has remote-control on, and owns that setting outright:
+/// with no remote-control session it is switched back off, whoever set it, because a leftover
+/// `disablesleep 1` means a laptop that stays awake in a bag. The setting needs root, so it goes through
+/// `sudo -n pmset` (see install-awake.sh); that is the only child process this app starts, and only
+/// when the state flips.
 final class KeepAwake {
     private let lock = NSLock()
     private var inFlight = false
     private var failed = false
+    private var quitting = false
     private var retryAt = Date.distantPast
     var onChange: (() -> Void)?
 
     /// Returns what the remote-control cell shows: "awake", "batt low", "awake ✗" or "".
     func update(rcOn: Bool) -> String {
         lock.lock(); defer { lock.unlock() }
+        guard !quitting else { return "" }
         let low = rcOn && batteryLow()
         let want = rcOn && !low
         let actual = sleepDisabled()
-        let ours = FileManager.default.fileExists(atPath: awakeMarker)
-        if want && !actual {
-            set(true)
-        } else if !want && ours {
-            if actual { set(false) } else { try? FileManager.default.removeItem(atPath: awakeMarker) }
-        }
+        if want != actual { set(want) }
         if actual { return "awake" }
         if low { return "batt low" }
         return want && failed ? "awake ✗" : ""
@@ -217,14 +214,12 @@ final class KeepAwake {
     private func set(_ on: Bool) {
         guard !inFlight, Date() >= retryAt else { return }
         inFlight = true
-        if on { FileManager.default.createFile(atPath: awakeMarker, contents: nil) }
         DispatchQueue.global(qos: .utility).async {
             let ok = KeepAwake.pmset(on)
             self.lock.lock()
             self.inFlight = false
             if ok {
                 log("keep-awake \(on ? "on" : "off")")
-                if !on { try? FileManager.default.removeItem(atPath: awakeMarker) }
             } else if !self.failed {
                 log("keep-awake: sudo pmset failed; run ./install-awake.sh")
             }
@@ -246,13 +241,15 @@ final class KeepAwake {
         return p.terminationStatus == 0
     }
 
-    /// On quit (launchd sends SIGTERM): `disablesleep` persists across reboots, so never leave ours behind.
+    /// On quit (launchd sends SIGTERM): `disablesleep` persists across reboots, so never leave it behind.
     func restoreForExit() {
-        guard FileManager.default.fileExists(atPath: awakeMarker) else { return }
-        if !sleepDisabled() || KeepAwake.pmset(false) {
-            try? FileManager.default.removeItem(atPath: awakeMarker)
-            log("keep-awake off (quit)")
+        lock.lock(); quitting = true; lock.unlock()   // a refresh racing with the exit must not turn it back on
+        for _ in 0..<30 {
+            lock.lock(); let busy = inFlight; lock.unlock()
+            if !busy { break }
+            usleep(100_000)
         }
+        if sleepDisabled() { log("keep-awake off (quit)\(KeepAwake.pmset(false) ? "" : " failed")") }
     }
 }
 

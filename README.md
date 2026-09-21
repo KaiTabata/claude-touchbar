@@ -33,6 +33,8 @@ Control Strip:   26%        緑 = アイドル · オレンジ = 実行中のセ
   セッションが終われば元に戻ります。有効なあいだは Control Strip に青緑の点、remote-control セルに `awake` が出ます。
   いま見ているセッションが off でも、他のセッションが on なら `off · 1 other on · awake` のように理由がわかる表示になります。
   バッテリー駆動で残量 15% 以下になったら解除します（`batt low`）。アプリ終了時も必ず元に戻します。
+  この設定はアプリが完全に管理します：on のセッションがなければ、手動で `pmset disablesleep 1` にしていても 0 に戻します
+  （戻し忘れたままカバンの中で動き続ける事故を防ぐため）。
   以前は [Capsomnia](https://github.com/fuji-mak/capsomnia)（Caps Lock 連動）でやっていたことの置き換えです。
 - **他アプリの Touch Bar を置き換え** – `apps.txt` に書いたアプリ（初期値は Safari・Chrome・Finder）が最前面のあいだは、
   そのアプリのコントロールの代わりに一覧ビューを表示します。ファイルを編集するだけで追加・削除でき、再ビルドは不要です。
