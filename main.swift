@@ -7,6 +7,7 @@
 // and the remote-control status pinned to the right end.
 // Tapping a session brings its Terminal tab to the front and switches to that session's detail view.
 // While a Terminal tab running Claude Code is frontmost, the bar follows it automatically.
+// While an app listed in apps.txt (Safari, Chrome, ...) is frontmost, the list view replaces that app's Touch Bar.
 //
 // Designed to cost nothing when idle: no child processes, no network. It reads a few small JSON
 // files and asks the kernel for process info, every 2s while the bar is visible or Terminal is
@@ -27,6 +28,16 @@ let sessionsDir = home + "/.claude/sessions"
 let stateDir = home + "/.claude/cache/touchbar"
 let usageFile = home + "/.claude/cache/usage-latest.json"
 let logPath = home + "/.config/claude-touchbar/touchbar.log"
+let appsFile = home + "/.config/claude-touchbar/apps.txt"
+
+/// Bundle ids whose own Touch Bar gets replaced by the list view. One per line, # for comments.
+func loadListApps() -> Set<String> {
+    guard let text = try? String(contentsOfFile: appsFile, encoding: .utf8) else { return [] }
+    let ids = text.split(separator: "\n")
+        .map { $0.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0].trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    return Set(ids)
+}
 
 func log(_ s: String) {
     let line = "\(Date()) \(s)\n"
@@ -458,9 +469,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     var ticks = 0
     var sessionTTYs: [String: Int] = [:]   // tty -> claude pid, from the latest snapshot
 
-    // follow-the-front-tab state
-    var frontPid: Int? = nil
+    // What the frontmost app calls for: a session's detail (Terminal tab running Claude),
+    // the list (apps in apps.txt), or nothing. `key` tells two list apps apart.
+    struct AutoTarget: Equatable {
+        let mode: Mode
+        let key: String
+    }
+    var autoTarget: AutoTarget? = nil
     var autoPresented = false
+    var listApps = loadListApps()
 
     var terminalIsFront: Bool {
         NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal"
@@ -522,8 +539,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         }
         ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
             self?.setPresence(true)
+            self?.listApps = loadListApps()   // picks up edits to apps.txt without a rebuild
             self?.checkFront()
         }
+        checkFront()
     }
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier id: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
@@ -602,7 +621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         if bar.isVisible {
             dismiss()
         } else {
-            if let pid = frontPid { mode = .detail(pid) } else { mode = .list }
+            mode = autoTarget?.mode ?? .list
             present()
             refresh(forceShells: true)
         }
@@ -624,22 +643,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         refresh()
     }
 
-    // ── follow the front Terminal tab ───────────────────
+    // ── follow the frontmost app ────────────────────────
     func checkFront() {
-        guard terminalIsFront else { frontChanged(to: nil); return }
-        terminal.frontTTY { [weak self] tty in
-            guard let self = self, self.terminalIsFront else { return }
-            self.frontChanged(to: tty.flatMap { self.sessionTTYs[$0] })
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+        if front == "com.apple.Terminal" {
+            terminal.frontTTY { [weak self] tty in
+                guard let self = self, self.terminalIsFront else { return }
+                let pid = tty.flatMap { self.sessionTTYs[$0] }
+                self.autoTargetChanged(to: pid.map { AutoTarget(mode: .detail($0), key: "pid \($0)") })
+            }
+        } else if listApps.contains(front) {
+            autoTargetChanged(to: AutoTarget(mode: .list, key: front))
+        } else {
+            autoTargetChanged(to: nil)
         }
     }
 
-    /// Acts only on changes, so closing the bar or going back to the list sticks until the tab changes.
-    func frontChanged(to pid: Int?) {
-        guard pid != frontPid else { return }
-        frontPid = pid
-        log("front tab -> \(pid.map { "claude pid \($0)" } ?? "none")")
-        if let pid = pid {
-            setMode(.detail(pid))
+    /// Acts only on changes, so closing the bar or going back to the list sticks until the app or tab changes.
+    func autoTargetChanged(to target: AutoTarget?) {
+        guard target != autoTarget else { return }
+        autoTarget = target
+        log("auto -> \(target?.key ?? "none")")
+        if let target = target {
+            setMode(target.mode)
             if !bar.isVisible {
                 present()
                 autoPresented = true

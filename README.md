@@ -19,6 +19,8 @@ Detail view:     ‹ all   ● ~/src/my-app            ● $ npm run dev    ⎇ 
   path, pid/tty, running Bash-tool commands, context tokens, model/effort/fast/thinking, lines changed,
   uptime/API time/cost, prompt-cache TTL and hit rate, version, remote-control status.
 - **Follows you** – while a Terminal tab running Claude Code is frontmost, the bar shows that session automatically.
+- **Replaces other apps' Touch Bars** – while an app listed in `apps.txt` (Safari and Chrome by default) is frontmost,
+  the list view is shown instead of that app's controls. Edit the file to add or remove apps; no rebuild needed.
 
 ## Load
 

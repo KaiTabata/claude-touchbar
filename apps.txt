@@ -1,0 +1,5 @@
+# Apps whose own Touch Bar is replaced by the Claude list view while they are frontmost.
+# One bundle id per line. Find one with:  osascript -e 'id of app "Safari"'
+# Edits apply the next time you switch apps; no rebuild needed.
+com.apple.Safari
+com.google.Chrome
