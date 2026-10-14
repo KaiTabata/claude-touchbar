@@ -12,6 +12,8 @@
 // While an app listed in apps.txt (Safari, Chrome, Finder, ...) is frontmost, the list view replaces that app's Touch Bar.
 // While any session has remote-control on, system sleep is disabled (lid closed included) so the
 // session stays reachable; a teal dot / "awake" marks it. Needs the sudoers rule from install-awake.sh.
+// "allow sleep" in the remote-control cell's info view relaxes that to idle sleep only (closing the lid
+// sleeps) until the power adapter is plugged in again; "sleep" marks it.
 //
 // Designed to cost nothing when idle: no network, and no child processes except one `pmset` call
 // when keep-awake flips. It reads a few small JSON files and asks the kernel for process info,
@@ -28,6 +30,7 @@
 import AppKit
 import IOKit
 import IOKit.ps
+import IOKit.pwr_mgt
 
 let home = NSHomeDirectory()
 let sessionsDir = home + "/.claude/sessions"
@@ -172,17 +175,17 @@ func sleepDisabled() -> Bool {
     return (v as? Bool) ?? false
 }
 
-/// On battery at 15% or less: not worth draining a closed laptop to zero.
-func batteryLow() -> Bool {
+/// Whether the power adapter is connected, and the battery level when it is not.
+func powerState() -> (onAC: Bool, battery: Int?) {
     let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
-    guard (IOPSGetProvidingPowerSourceType(info).takeUnretainedValue() as String) == kIOPMBatteryPowerKey else { return false }
+    guard (IOPSGetProvidingPowerSourceType(info).takeUnretainedValue() as String) == kIOPMBatteryPowerKey else { return (true, nil) }
     for ps in IOPSCopyPowerSourcesList(info).takeRetainedValue() as [CFTypeRef] {
         if let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
            let pct = d[kIOPSCurrentCapacityKey] as? Int {
-            return pct <= 15
+            return (false, pct)
         }
     }
-    return false
+    return (false, nil)
 }
 
 /// Disables system sleep while some session has remote-control on, and owns that setting outright:
@@ -190,25 +193,57 @@ func batteryLow() -> Bool {
 /// `disablesleep 1` means a laptop that stays awake in a bag. The setting needs root, so it goes through
 /// `sudo -n pmset` (see install-awake.sh); that is the only child process this app starts, and only
 /// when the state flips.
+///
+/// "allow sleep" trades that for a power assertion against idle sleep, which closing the lid still
+/// overrides, to save the battery. It lasts until the power adapter is plugged in again.
 final class KeepAwake {
     private let lock = NSLock()
     private var inFlight = false
     private var failed = false
     private var quitting = false
     private var retryAt = Date.distantPast
+    private var allowSleep_ = false
+    private var wasOnAC = true
+    private var idleAssertion: IOPMAssertionID = 0
     var onChange: (() -> Void)?
 
-    /// Returns what the remote-control cell shows: "awake", "batt" (low battery), "sudo✗" or "".
+    var allowSleep: Bool { lock.lock(); defer { lock.unlock() }; return allowSleep_ }
+
+    func toggleAllowSleep() {
+        lock.lock(); allowSleep_.toggle(); let on = allowSleep_; lock.unlock()
+        log("allow sleep \(on ? "on" : "off")")
+    }
+
+    /// Returns what the remote-control cell shows: "awake", "sleep" (allow sleep), "batt" (low battery), "sudo✗" or "".
     func update(rcOn: Bool) -> String {
         lock.lock(); defer { lock.unlock() }
         guard !quitting else { return "" }
-        let low = rcOn && batteryLow()
-        let want = rcOn && !low
+        let power = powerState()
+        if power.onAC && !wasOnAC && allowSleep_ {
+            allowSleep_ = false
+            log("allow sleep off (power adapter connected)")
+        }
+        wasOnAC = power.onAC
+        let low = rcOn && (power.battery ?? 100) <= 15   // not worth draining a closed laptop to zero
+        let want = rcOn && !low && !allowSleep_
         let actual = sleepDisabled()
         if want != actual { set(want) }
+        holdIdle(rcOn && !low && allowSleep_)
         if actual { return "awake" }
         if low { return "batt" }
+        if rcOn && allowSleep_ { return "sleep" }
         return want && failed ? "sudo✗" : ""
+    }
+
+    private func holdIdle(_ on: Bool) {
+        if on && idleAssertion == 0 {
+            IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                                        IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                        "Claude Code remote-control" as CFString, &idleAssertion)
+        } else if !on && idleAssertion != 0 {
+            IOPMAssertionRelease(idleAssertion)
+            idleAssertion = 0
+        }
     }
 
     private func set(_ on: Bool) {
@@ -301,6 +336,7 @@ struct Snapshot {
     var weekReset = 0
     var sessions: [Session] = []
     var awake = ""              // KeepAwake.update's label
+    var allowSleep = false
 }
 
 func loadSnapshot(withShells: Bool) -> Snapshot {
@@ -351,9 +387,11 @@ struct Row: Equatable {
 }
 
 /// A slash command offered in the info view. `confirm` asks for a second tap.
+/// `local` actions are handled by this app instead of being typed into the session.
 struct Action: Equatable {
     let command: String
     var confirm = false
+    var local = false
 }
 
 struct Render: Equatable {
@@ -471,6 +509,7 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
         if let live = live { out.cells.append(live) }
         out.cells.append(Row(state: "jp", l1: help.l1, l2: help.l2))
         out.actions = session == nil ? [] : help.actions
+        if key == "rc" { out.actions.append(Action(command: snap.allowSleep ? "keep awake" : "allow sleep", local: true)) }
     }
     out.rc.key = "rc"
     if case .info = mode {} else if !snap.awake.isEmpty { out.rc.tail = " · " + snap.awake }
@@ -526,7 +565,7 @@ func helpText(for key: String, shell: ShellJob?) -> Help {
                     actions: [Action(command: "/usage")])
     case "rc":
         return Help(l1: "Remote Control です。on のセッションは claude.ai やスマホアプリから続きを操作できます。/remote-control で開始します。",
-                    l2: "on のセッションが 1 つでもある間は、蓋を閉じてもスリープしません（awake・青緑の点）。「off · +1」は他の 1 セッションが on の意味です。電池 15% 以下では解除します。",
+                    l2: "on の間は蓋を閉じても寝ません（awake）。allow sleep で蓋を閉じたら寝るように（sleep）、電源をつなぐと元に戻ります。電池 15% 以下では解除。「off · +1」は他の 1 セッションが on。",
                     actions: [Action(command: "/remote-control")])
     case "nostate":
         return Help(l1: "このセッションはまだ statusline のデータを書き出していません。",
@@ -571,7 +610,7 @@ func twoLines(_ row: Row, alignment: NSTextAlignment = .left) -> NSAttributedStr
     let indent = (dot != nil && alignment == .left) ? "  " : ""
     out.append(NSAttributedString(string: "\n" + indent + row.l2, attributes: [.font: line2Font, .foregroundColor: dimColor]))
     if !row.tail.isEmpty {
-        let tint = row.tail.hasSuffix("awake") ? awakeColor : NSColor.systemRed
+        let tint = row.tail.hasSuffix("awake") ? awakeColor : row.tail.hasSuffix("sleep") ? dimColor : NSColor.systemRed
         out.append(NSAttributedString(string: row.tail, attributes: [.font: line2Font, .foregroundColor: tint]))
     }
     out.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: out.length))
@@ -912,6 +951,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     }
 
     @objc func actionTapped(_ b: ActionButton) {
+        if b.action_?.local == true {
+            keepAwake.toggleAllowSleep()
+            refresh()
+            return
+        }
         guard let a = b.action_, modePid > 0, let tty = ttyName(of: pid_t(modePid)) else { return }
         if a.confirm && !b.armed {
             b.armed = true
@@ -989,6 +1033,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
             // the process table is only scanned while someone is looking
             var snap = loadSnapshot(withShells: visible)
             snap.awake = self.keepAwake.update(rcOn: snap.sessions.contains { !$0.bridge.isEmpty })
+            snap.allowSleep = self.keepAwake.allowSleep
             var ttys: [String: Int] = [:]
             for s in snap.sessions { if let t = s.tty { ttys[t] = s.pid } }
             let r = render(snap, mode: m)
