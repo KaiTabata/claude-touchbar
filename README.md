@@ -39,6 +39,15 @@ Control Strip:   26%        緑 = アイドル · オレンジ = 実行中のセ
   この設定はアプリが完全に管理します：on のセッションがなければ、手動で `pmset disablesleep 1` にしていても 0 に戻します
   （戻し忘れたままカバンの中で動き続ける事故を防ぐため）。
   以前は [Capsomnia](https://github.com/fuji-mak/capsomnia)（Caps Lock 連動）でやっていたことの置き換えです。
+- **remote-control をまとめて切り替え** – remote-control セルをタップすると `all on` / `all off` が出ます。
+  まだ off のセッション全部で `/remote-control` を実行、または on のセッション全部を切断します。切断は Claude Code の
+  メニュー（Disconnect this session / Continue）を自動で操作していて、メニューが画面に出たのを確認してから選びます。
+  確認ダイアログなどを表示中のセッションは飛ばします（`touchbar.log` に記録）。
+- **音声入力** – マイクのボタンで、そのセッションの Claude Code 内蔵の音声入力（`/voice`）を始めます。もう一度押すと
+  話した内容を送信、`✕` で破棄。文字起こしは Claude Code 側（Anthropic のサーバー）が行うので、精度も言語設定も
+  Claude Code のものです。詳細ビューではそのセッション、一覧ビューではセッションが1つだけのときに出ます。
+  押すとそのタブを前面に出して Space（開始・送信）や Esc（破棄）のキーを送るだけなので、キーボードで Space を押すのと同じ動きです。
+  録音中はボタンが赤くなります。入力欄に書きかけの文があると始まりません（Claude Code の仕様）。
 - **他アプリの Touch Bar を置き換え** – `apps.txt` に書いたアプリ（初期値は Safari・Chrome・Finder）が最前面のあいだは、
   そのアプリのコントロールの代わりに一覧ビューを表示します。ファイルを編集するだけで追加・削除でき、再ビルドは不要です。
 
@@ -73,6 +82,15 @@ cd ~/.config/claude-touchbar
 初回は macOS が「ClaudeTouchBar が Terminal を制御することを許可するか」を聞いてくるので許可してください。再ビルドすると
 ad-hoc 署名が変わるため、`./build.sh` のたびにこのダイアログがまた出ます。
 
+音声入力を使う場合は、さらに次の準備が要ります。
+
+- どれかのセッションで `/voice tap` を1回実行（タップで開始・タップで送信のモード。設定に保存され、全セッションに効きます。
+  キーボードでも、入力欄が空のときに Space で始まるようになります）。
+- 認識言語は Claude Code の `language` 設定に従います。日本語なら `~/.claude/settings.json` に `"language": "japanese"`。
+- システム設定 › プライバシーとセキュリティ › アクセシビリティ で ClaudeTouchBar を許可（キーを送るため）。
+  マイクのボタンを初めて押したときに案内が出ます。再ビルドすると署名が変わるので、一度リストから削除して許可し直してください。
+- Terminal にマイクの使用を許可（録音するのは Terminal 内の Claude Code です）。
+
 アンインストール：
 
 ```sh
@@ -91,6 +109,10 @@ sudo rm -f /etc/sudoers.d/claude-touchbar
 - セッション情報は Claude Code の非公式なファイル（`~/.claude/sessions/<pid>.json`）から取っています。remote-control は
   `bridgeSessionId` があればオンとみなします。実行中のシェルコマンドは、claude プロセスの子プロセスのうち引数が
   `~/.claude/shell-snapshots/` を参照しているものです。どれもバージョンが変わると変わる可能性があります。
+- 音声入力と remote-control の一括切り替えは、Terminal タブの画面の文字（`REC · tap to send`、`Disconnect this session`、
+  入力欄の罫線）を読んで状態を判断しています。Claude Code の表示が変わると動かなくなります。
+- コマンドラインからも実行できます（動作確認用）：`ClaudeTouchBar.app/Contents/MacOS/ClaudeTouchBar --rc-all on|off [pid]`、
+  `--voice <pid> toggle|cancel`。
 - セッションのタイトルは Claude Code のセッション名です。`/rename <name>` で変更するか、`claude -n <name>` で起動します。
 
 ## ライセンス

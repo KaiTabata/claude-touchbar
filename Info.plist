@@ -11,6 +11,6 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Finds which Terminal tab is in front and brings a Claude Code session's tab forward when you tap it on the Touch Bar.</string>
+    <string>Finds which Terminal tab is in front, brings a Claude Code session's tab forward, and types the slash commands you tap on the Touch Bar.</string>
 </dict>
 </plist>

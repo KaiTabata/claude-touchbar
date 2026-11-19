@@ -14,6 +14,10 @@
 // session stays reachable; a teal dot / "awake" marks it. Needs the sudoers rule from install-awake.sh.
 // "allow sleep" in the remote-control cell's info view relaxes that to idle sleep only (closing the lid
 // sleeps) until the power adapter is plugged in again; "sleep" marks it.
+// "all on" / "all off" in the same view switch remote-control for every session at once.
+// The mic button starts Claude Code's own voice dictation (/voice tap) in the session's Terminal tab:
+// tap to talk, tap again to send, ✕ to discard. It presses Space / Esc there, which needs the
+// Accessibility permission.
 //
 // Designed to cost nothing when idle: no network, and no child processes except one `pmset` call
 // when keep-awake flips. It reads a few small JSON files and asks the kernel for process info,
@@ -390,8 +394,10 @@ struct Row: Equatable {
 /// `local` actions are handled by this app instead of being typed into the session.
 struct Action: Equatable {
     let command: String
+    var label = ""      // button title; the command itself when empty
     var confirm = false
     var local = false
+    var title: String { label.isEmpty ? command : label }
 }
 
 struct Render: Equatable {
@@ -509,7 +515,11 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
         if let live = live { out.cells.append(live) }
         out.cells.append(Row(state: "jp", l1: help.l1, l2: help.l2))
         out.actions = session == nil ? [] : help.actions
-        if key == "rc" { out.actions.append(Action(command: snap.allowSleep ? "keep awake" : "allow sleep", local: true)) }
+        if key == "rc" {
+            if rcOn < snap.sessions.count { out.actions.append(Action(command: "rc-all-on", label: "all on", local: true)) }
+            if rcOn > 0 { out.actions.append(Action(command: "rc-all-off", label: "all off", local: true)) }
+            out.actions.append(Action(command: "allow-sleep", label: snap.allowSleep ? "keep awake" : "allow sleep", local: true))
+        }
     }
     out.rc.key = "rc"
     if case .info = mode {} else if !snap.awake.isEmpty { out.rc.tail = " · " + snap.awake }
@@ -564,7 +574,7 @@ func helpText(for key: String, shell: ShellJob?) -> Help {
                     l2: "5h が 90% 以上になると Control Strip の数字が赤くなります。/usage で詳しい内訳を確認できます。",
                     actions: [Action(command: "/usage")])
     case "rc":
-        return Help(l1: "Remote Control です。on のセッションは claude.ai やスマホアプリから続きを操作できます。/remote-control で開始します。",
+        return Help(l1: "Remote Control です。on のセッションは claude.ai やスマホアプリから続きを操作できます。all on / all off で全セッションをまとめて切り替えます。",
                     l2: "on の間は蓋を閉じても寝ません（awake）。allow sleep で蓋を閉じたら寝るように（sleep）、電源をつなぐと元に戻ります。電池 15% 以下では解除。「off · +1」は他の 1 セッションが on。",
                     actions: [Action(command: "/remote-control")])
     case "nostate":
@@ -650,6 +660,42 @@ enum Mode: Equatable {
     case info(Int, String)   // pid (0 = no session) and the Row.key being explained
 }
 
+// ── what a Claude Code tab is showing ───────────────────
+
+/// The visible text of a Terminal tab running Claude Code, read through AppleScript.
+/// It is plain text, so a suggested prompt and a half-typed one look the same.
+struct TermScreen {
+    let tail: [String]   // the bottom of the screen, blank lines dropped
+
+    init(_ text: String) {
+        tail = Array(text.split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.suffix(16))
+    }
+
+    func contains(_ s: String) -> Bool { tail.contains { $0.contains(s) } }
+
+    /// Claude Code's indicator while dictation is recording in "tap" mode.
+    var recording: Bool { contains("REC · tap to send") }
+
+    /// The prompt box is on screen: "❯" between two rules, just above the status lines.
+    /// A permission prompt or a menu replaces it, and keys typed then would answer that instead.
+    var hasPrompt: Bool {
+        let rules = tail.indices.filter { i in
+            let t = tail[i].trimmingCharacters(in: .whitespaces)
+            return t.count >= 20 && t.allSatisfy { $0 == "─" }
+        }
+        guard rules.count >= 2 else { return false }
+        let top = rules[rules.count - 2], bottom = rules[rules.count - 1]
+        return bottom > top + 1 && bottom >= tail.count - 8 && tail[top + 1].hasPrefix("❯")
+    }
+}
+
+/// Dictation needs `/voice tap`: in the default hold mode a single Space press only types a space.
+func voiceTapEnabled() -> Bool {
+    guard let v = readJSON(home + "/.claude/settings.json")?.dict("voice") else { return false }
+    return v.bool("enabled") && v.str("mode") == "tap"
+}
+
 // ── Terminal.app via in-process AppleScript (needs the one-time Automation permission) ──
 
 final class TerminalBridge {
@@ -682,50 +728,153 @@ final class TerminalBridge {
         }
     }
 
-    /// Types a slash command into the tab (Terminal's `do script ... in tab` sends the text plus return).
+    private func run(_ source: String) -> (value: String?, error: String?) {
+        var err: NSDictionary?
+        let r = NSAppleScript(source: source)?.executeAndReturnError(&err)
+        return (r?.stringValue, err.map { "\($0[NSAppleScript.errorMessage] ?? $0)" })
+    }
+
+    private func valid(_ tty: String) -> Bool {
+        tty.range(of: "^ttys[0-9]+$", options: .regularExpression) != nil
+    }
+
+    /// AppleScript that runs `body` for the tab on this tty, as `tab ti of window wi`. Returns "" when there is none.
+    /// (Index-based on purpose: with `repeat with t in tabs`, `contents of t` yields the reference, not the text.)
+    private func onTab(_ tty: String, _ body: String) -> String {
+        """
+        tell application "Terminal"
+            repeat with wi from 1 to count of windows
+                repeat with ti from 1 to count of tabs of window wi
+                    if tty of tab ti of window wi is "/dev/\(tty)" then
+                        \(body)
+                    end if
+                end repeat
+            end repeat
+            return ""
+        end tell
+        """
+    }
+
+    /// The visible text of the tab, nil when the tty has no Terminal tab.
+    private func screen(_ tty: String) -> TermScreen? {
+        let r = run(onTab(tty, "return contents of tab ti of window wi"))
+        guard let text = r.value, !text.isEmpty else { return nil }
+        return TermScreen(text)
+    }
+
+    /// `do script` types the expression's text followed by return.
+    private func type(_ expr: String, tty: String) -> Bool {
+        let r = run(onTab(tty, "do script \(expr) in tab ti of window wi\nreturn \"ok\""))
+        if let e = r.error { log("type failed: \(e)") }
+        return r.value == "ok"
+    }
+
+    private func focusNow(_ tty: String) -> Bool {
+        let r = run(onTab(tty, """
+            if miniaturized of window wi then set miniaturized of window wi to false
+            set selected tab of window wi to tab ti of window wi
+            set frontmost of window wi to true
+            activate
+            return "ok"
+            """))
+        if let e = r.error { log("focus failed: \(e)") }
+        return r.value == "ok"
+    }
+
+    /// Types a slash command into the tab.
     func send(_ command: String, toTTY tty: String) {
-        guard tty.range(of: "^ttys[0-9]+$", options: .regularExpression) != nil,
-              command.range(of: "^/[a-z-]+$", options: .regularExpression) != nil else { return }
+        guard valid(tty), command.range(of: "^/[a-z-]+$", options: .regularExpression) != nil else { return }
         queue.async {
-            let script = NSAppleScript(source: """
-                tell application "Terminal"
-                    repeat with w in windows
-                        repeat with t in tabs of w
-                            if tty of t is "/dev/\(tty)" then
-                                do script "\(command)" in t
-                                return
-                            end if
-                        end repeat
-                    end repeat
-                end tell
-                """)
-            var err: NSDictionary?
-            script?.executeAndReturnError(&err)
-            if let err = err { log("send failed: \(err[NSAppleScript.errorMessage] ?? err)") } else { log("sent \(command) to \(tty)") }
+            if self.type("\"\(command)\"", tty: tty) { log("sent \(command) to \(tty)") }
         }
     }
 
     func focus(tty: String) {
-        guard tty.range(of: "^ttys[0-9]+$", options: .regularExpression) != nil else { return }
+        guard valid(tty) else { return }
+        queue.async { _ = self.focusNow(tty) }
+    }
+
+    // ── remote-control for every session ────────────────
+
+    /// Runs /remote-control in each tab. Turning it on is that alone. Turning it off opens a menu whose
+    /// cursor starts on "Continue", the last entry; "Disconnect this session" is the first, and five ups
+    /// land on it whether the menu has two or three entries and whether or not it wraps around.
+    /// The ups are only sent once the menu is on screen: in the prompt they would recall an old message
+    /// and the return would send it. `done` runs on the bridge queue with the number of tabs switched.
+    func rcAll(on: Bool, ttys: [String], done: @escaping (Int) -> Void) {
         queue.async {
-            let script = NSAppleScript(source: """
-                tell application "Terminal"
-                    repeat with w in windows
-                        repeat with t in tabs of w
-                            if tty of t is "/dev/\(tty)" then
-                                if miniaturized of w then set miniaturized of w to false
-                                set selected tab of w to t
-                                set index of w to 1
-                                activate
-                                return
-                            end if
-                        end repeat
-                    end repeat
-                end tell
-                """)
-            var err: NSDictionary?
-            script?.executeAndReturnError(&err)
-            if let err = err { log("focus failed: \(err[NSAppleScript.errorMessage] ?? err)") }
+            var ok = 0
+            for tty in ttys where self.valid(tty) {
+                guard let s = self.screen(tty), s.hasPrompt else {
+                    log("rc all \(on ? "on" : "off"): skipped \(tty) (no Terminal tab, or it is showing a dialog)")
+                    continue
+                }
+                guard self.type("\"/remote-control\"", tty: tty) else { continue }
+                if on { ok += 1; continue }
+                var menu = false
+                for _ in 0..<15 where !menu {
+                    usleep(200_000)
+                    menu = self.screen(tty)?.contains("Disconnect this session") ?? false
+                }
+                guard menu else { log("rc all off: no disconnect menu on \(tty)"); continue }
+                let up = "((ASCII character 27) & \"[A\")"
+                if self.type([String](repeating: up, count: 5).joined(separator: " & "), tty: tty) { ok += 1 }
+            }
+            log("rc all \(on ? "on" : "off"): \(ok)/\(ttys.count)")
+            done(ok)
+        }
+    }
+
+    // ── voice dictation ─────────────────────────────────
+
+    enum VoiceOp { case toggle, cancel }
+    enum VoiceResult: String { case recording, sent, cancelled, idle, noTab, blocked, notStarted }
+
+    /// A key press delivered to Terminal's key window. `do script` cannot do this: it always adds a return,
+    /// which would send a half-typed prompt, and Claude Code drops the dictation if the prompt changes under it.
+    private func press(_ key: CGKeyCode) -> Bool {
+        guard let term = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else { return false }
+        let src = CGEventSource(stateID: .hidSystemState)
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) else { return false }
+            e.flags = []
+            e.postToPid(term.processIdentifier)
+            usleep(20_000)
+        }
+        return true
+    }
+
+    /// Whether the tab shows Claude Code recording. nil when the tab is gone.
+    func isRecording(tty: String, _ done: @escaping (Bool?) -> Void) {
+        guard valid(tty) else { return }
+        queue.async { done(self.screen(tty)?.recording) }
+    }
+
+    /// Toggle: Space starts dictation, or stops it and sends what was said (Claude Code's "tap" voice mode).
+    /// Cancel: Esc while recording discards it; Esc is never pressed otherwise, it would interrupt a running turn.
+    /// The tab is brought to the front first because the key goes to whichever tab has the keyboard.
+    /// `done` runs on the bridge queue.
+    func voice(_ op: VoiceOp, tty: String, done: @escaping (VoiceResult) -> Void) {
+        guard valid(tty) else { return }
+        queue.async {
+            guard self.focusNow(tty) else { done(.noTab); return }
+            usleep(300_000)
+            let front = self.frontScript?.executeAndReturnError(nil).stringValue ?? ""
+            guard front == "/dev/\(tty)", let before = self.screen(tty) else { done(.noTab); return }
+            let was = before.recording
+            if op == .cancel {
+                if was { _ = self.press(53) }
+                done(was ? .cancelled : .idle)
+                return
+            }
+            guard was || before.hasPrompt else { done(.blocked); return }
+            guard self.press(49) else { done(.noTab); return }
+            if was { done(.sent); return }
+            for _ in 0..<8 {
+                usleep(250_000)
+                if self.screen(tty)?.recording == true { done(.recording); return }
+            }
+            done(.notStarted)
         }
     }
 }
@@ -737,6 +886,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     var trayButton: NSButton!
     let usageCell = makeCell()
     var backButton: NSButton!
+    var micButton: NSButton!
+    var cancelButton: NSButton!
+    let hintLabel = NSTextField(labelWithString: "")
     let leadStack = NSStackView()
     let cellStack = NSStackView()
     let actionStack = NSStackView()
@@ -751,6 +903,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     var last = Render()
     var ticks = 0
     var sessionTTYs: [String: Int] = [:]   // tty -> claude pid, from the latest snapshot
+    var rcOnPids: Set<Int> = []            // sessions with remote-control on, from the latest snapshot
+    var voice: (tty: String, pid: Int)?    // the session that is recording dictation
+    var voiceBusy = false
+    var rcBusy = false
+    var hintSerial = 0
 
     // What the frontmost app calls for: a session's detail (Terminal tab running Claude),
     // the list (apps in apps.txt), or nothing. `key` tells two list apps apart.
@@ -778,7 +935,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         backButton.isHidden = true
         leadStack.orientation = .horizontal
         leadStack.spacing = 8
+        micButton = NSButton(image: NSImage(named: NSImage.touchBarAudioInputTemplateName)!, target: self, action: #selector(micTapped))
+        micButton.isHidden = true
+        cancelButton = NSButton(title: "✕", target: self, action: #selector(voiceCancelTapped))
+        cancelButton.font = line1Font
+        cancelButton.isHidden = true
+        hintLabel.font = line2Font
+        hintLabel.textColor = .systemOrange
+        hintLabel.isHidden = true
         leadStack.addArrangedSubview(backButton)
+        leadStack.addArrangedSubview(micButton)
+        leadStack.addArrangedSubview(cancelButton)
+        leadStack.addArrangedSubview(hintLabel)
         leadStack.addArrangedSubview(usageCell)
 
         cellStack.orientation = .horizontal
@@ -951,9 +1119,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     }
 
     @objc func actionTapped(_ b: ActionButton) {
-        if b.action_?.local == true {
-            keepAwake.toggleAllowSleep()
-            refresh()
+        if let a = b.action_, a.local {
+            switch a.command {
+            case "allow-sleep":
+                keepAwake.toggleAllowSleep()
+                refresh()
+            case "rc-all-on", "rc-all-off":
+                rcAll(on: a.command == "rc-all-on", button: b)
+            default:
+                break
+            }
             return
         }
         guard let a = b.action_, modePid > 0, let tty = ttyName(of: pid_t(modePid)) else { return }
@@ -976,6 +1151,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         guard m != mode else { return }
         mode = m
         refresh()
+    }
+
+    /// Switches remote-control for every session that is not already in the wanted state.
+    func rcAll(on: Bool, button: NSButton) {
+        guard !rcBusy else { return }
+        let ttys = sessionTTYs.filter { rcOnPids.contains($0.value) != on }.map { $0.key }.sorted()
+        guard !ttys.isEmpty else { return }
+        rcBusy = true
+        button.title = "…"
+        terminal.rcAll(on: on, ttys: ttys) { ok in
+            // the session files catch up a moment after the command lands
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self.rcBusy = false
+                self.last.actions = []   // rebuild the buttons even when the same set comes back
+                if ok < ttys.count { self.showHint("\(ok)/\(ttys.count) switched · see log") }
+                self.refresh()
+            }
+        }
+    }
+
+    // ── voice dictation ─────────────────────────────────
+
+    /// The session the mic button talks to: the one being shown, or the only one there is.
+    var micTarget: (tty: String, pid: Int)? {
+        if let v = voice { return v }
+        let pid = modePid > 0 ? modePid : (sessionTTYs.count == 1 ? sessionTTYs.first!.value : 0)
+        guard pid > 0, let tty = sessionTTYs.first(where: { $0.value == pid })?.key else { return nil }
+        return (tty, pid)
+    }
+
+    func showHint(_ text: String) {
+        hintSerial += 1
+        let serial = hintSerial
+        hintLabel.stringValue = text
+        hintLabel.isHidden = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self = self, self.hintSerial == serial else { return }
+            self.hintLabel.isHidden = true
+        }
+    }
+
+    func updateMic() {
+        micButton.isHidden = micTarget == nil
+        micButton.bezelColor = voice == nil ? nil : .systemRed
+        cancelButton.isHidden = voice == nil
+    }
+
+    @objc func micTapped() { voiceKey(.toggle) }
+    @objc func voiceCancelTapped() { voiceKey(.cancel) }
+
+    func voiceKey(_ op: TerminalBridge.VoiceOp) {
+        guard !voiceBusy, let target = micTarget else { return }
+        guard voiceTapEnabled() else { showHint("voice is off · run /voice tap"); return }
+        let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        guard AXIsProcessTrustedWithOptions(prompt) else {
+            log("voice: no Accessibility permission")
+            showHint("allow Accessibility for ClaudeTouchBar")
+            return
+        }
+        voiceBusy = true
+        terminal.voice(op, tty: target.tty) { result in
+            DispatchQueue.main.async {
+                self.voiceBusy = false
+                log("voice \(op) on \(target.tty): \(result.rawValue)")
+                switch result {
+                case .recording: self.voice = target
+                case .sent, .cancelled, .idle: self.voice = nil
+                case .noTab: self.voice = nil; self.showHint("no Terminal tab for this session")
+                case .blocked: self.showHint("session is asking something")
+                case .notStarted: self.showHint("not recording · prompt not empty?")
+                }
+                self.updateMic()
+            }
+        }
     }
 
     // ── follow the frontmost app ────────────────────────
@@ -1019,6 +1268,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         guard active || ticks % 5 == 0 else { return }   // idle: every 10s
 
         if terminalIsFront { checkFront() }
+        if let v = voice, !voiceBusy {
+            // stopped from the keyboard, or the session ended
+            terminal.isRecording(tty: v.tty) { rec in
+                DispatchQueue.main.async {
+                    guard rec != true, !self.voiceBusy, self.voice?.tty == v.tty else { return }
+                    self.voice = nil
+                    self.updateMic()
+                }
+            }
+        }
         refresh()
         if !bar.isVisible {
             // keep the Control Strip registration alive; fully reinstall once a minute
@@ -1036,9 +1295,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
             snap.allowSleep = self.keepAwake.allowSleep
             var ttys: [String: Int] = [:]
             for s in snap.sessions { if let t = s.tty { ttys[t] = s.pid } }
+            let rcOn = Set(snap.sessions.filter { !$0.bridge.isEmpty }.map { $0.pid })
             let r = render(snap, mode: m)
             DispatchQueue.main.async {
                 self.sessionTTYs = ttys
+                self.rcOnPids = rcOn
+                self.updateMic()
                 guard m == self.mode else { return }
                 self.apply(r)
             }
@@ -1059,7 +1321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
                 v.removeFromSuperview()
             }
             for a in r.actions {
-                let b = ActionButton(title: a.command, target: self, action: #selector(actionTapped(_:)))
+                let b = ActionButton(title: a.title, target: self, action: #selector(actionTapped(_:)))
                 b.font = line1Font
                 b.action_ = a
                 actionStack.addArrangedSubview(b)
@@ -1105,6 +1367,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         }
         last = r
     }
+}
+
+// Command-line use, mostly for testing without a finger on the bar. Run from Terminal these borrow
+// Terminal's own Automation and Accessibility permissions.
+//   ClaudeTouchBar --rc-all on|off [claude pid]
+//   ClaudeTouchBar --voice <claude pid> toggle|cancel
+if CommandLine.arguments.count >= 3 {
+    let args = CommandLine.arguments
+    let sessions = loadSnapshot(withShells: false).sessions
+    let bridge = TerminalBridge()
+    let wait = DispatchSemaphore(value: 0)
+    if args[1] == "--rc-all", ["on", "off"].contains(args[2]) {
+        let on = args[2] == "on"
+        let only = args.count >= 4 ? args[3] : ""   // optional: just this claude pid
+        let ttys = sessions.filter { $0.bridge.isEmpty == on && (only.isEmpty || "\($0.pid)" == only) }.compactMap { $0.tty }
+        bridge.rcAll(on: on, ttys: ttys) { ok in print("switched \(ok)/\(ttys.count)"); wait.signal() }
+        wait.wait()
+        exit(0)
+    }
+    if args[1] == "--voice", args.count >= 4, let s = sessions.first(where: { "\($0.pid)" == args[2] }), let tty = s.tty {
+        guard voiceTapEnabled() else { print("voice is off: run /voice tap"); exit(1) }
+        guard AXIsProcessTrusted() else { print("no Accessibility permission"); exit(1) }
+        bridge.voice(args[3] == "cancel" ? .cancel : .toggle, tty: tty) { r in print(r.rawValue); wait.signal() }
+        wait.wait()
+        exit(0)
+    }
+    print("usage: ClaudeTouchBar [--rc-all on|off [claude pid] | --voice <claude pid> toggle|cancel]")
+    exit(2)
 }
 
 let app = NSApplication.shared
