@@ -679,10 +679,11 @@ struct TermScreen {
 
     /// The prompt box is on screen: "❯" between two rules, just above the status lines.
     /// A permission prompt or a menu replaces it, and keys typed then would answer that instead.
+    /// A named session carries its name inside the upper rule ("──── name ─"), so a rule is a line
+    /// that starts with a long run of "─", not one made of nothing else.
     var hasPrompt: Bool {
         let rules = tail.indices.filter { i in
-            let t = tail[i].trimmingCharacters(in: .whitespaces)
-            return t.count >= 20 && t.allSatisfy { $0 == "─" }
+            tail[i].trimmingCharacters(in: .whitespaces).prefix { $0 == "─" }.count >= 20
         }
         guard rules.count >= 2 else { return false }
         let top = rules[rules.count - 2], bottom = rules[rules.count - 1]
