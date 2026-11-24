@@ -40,6 +40,10 @@ let home = NSHomeDirectory()
 let sessionsDir = home + "/.claude/sessions"
 let stateDir = home + "/.claude/cache/touchbar"
 let usageFile = home + "/.claude/cache/usage-latest.json"
+// Optional: the voice-call bot (a Discord bot that talks to Claude Code). The cell only shows when its LaunchAgent exists.
+let callLabel = "com.kaitabata.claude-call"
+let callPlist = home + "/Library/LaunchAgents/" + callLabel + ".plist"
+let callStatusFile = home + "/Developer/claude-call/status.json"
 let logPath = home + "/.config/claude-touchbar/touchbar.log"
 let appsFile = home + "/.config/claude-touchbar/apps.txt"
 
@@ -341,6 +345,30 @@ struct Snapshot {
     var sessions: [Session] = []
     var awake = ""              // KeepAwake.update's label
     var allowSleep = false
+    var call = ""               // voice-call bot: "" (not installed) | off | on | talk | work
+}
+
+/// The bot writes its pid and state to a small file; a dead pid means it is off.
+func callState() -> String {
+    guard FileManager.default.fileExists(atPath: callPlist) else { return "" }
+    guard let j = readJSON(callStatusFile), j.int("pid") > 0, kill(pid_t(j.int("pid")), 0) == 0 else { return "off" }
+    return j.bool("inCall") ? "talk" : j.int("bg") > 0 ? "work" : "on"
+}
+
+/// Turning it off also disables the LaunchAgent, so it stays off across logins.
+func setCall(on: Bool) {
+    let target = "gui/\(getuid())/" + callLabel
+    let steps = on ? [["enable", target], ["bootstrap", "gui/\(getuid())", callPlist]]
+                   : [["disable", target], ["bootout", target]]
+    for args in steps {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() } catch { log("launchctl \(args[0]) failed: \(error)") }
+    }
+    log("call \(on ? "on" : "off")")
 }
 
 func loadSnapshot(withShells: Bool) -> Snapshot {
@@ -376,6 +404,7 @@ func loadSnapshot(withShells: Bool) -> Snapshot {
     }
     // busy sessions first, then most recently changed
     snap.sessions.sort { ($0.busy ? 0 : 1, -$0.since) < ($1.busy ? 0 : 1, -$1.since) }
+    snap.call = callState()
     return snap
 }
 
@@ -426,6 +455,9 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
     if (snap.five ?? 0) >= 90 { out.trayState = "hot" }
     out.trayAwake = snap.awake == "awake"
     let rcOn = snap.sessions.filter { !$0.bridge.isEmpty }.count
+    let callRow: Row? = snap.call.isEmpty ? nil : Row(
+        state: snap.call == "off" ? "off" : snap.call == "on" ? "on" : "busy", l1: "call",
+        l2: ["off": "off", "on": "on · standby", "talk": "on · in call", "work": "on · working"][snap.call] ?? snap.call, key: "call")
 
     switch mode {
     case .list:
@@ -440,6 +472,7 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
             out.cells.append(Row(state: s.busy ? "busy" : "idle", l1: l1, l2: l2, pid: s.pid))
         }
         if out.cells.isEmpty { out.cells = [Row(l1: "no sessions", l2: "claude is not running")] }
+        if let c = callRow { out.cells.append(c) }
         out.rc = rcOn > 0
             ? Row(state: "on", l1: "remote-control", l2: "\(rcOn)/\(snap.sessions.count) on")
             : Row(state: "off", l1: "remote-control", l2: "off")
@@ -491,6 +524,7 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
 
             out.cells.append(Row(l1: "v" + st.str("version"), l2: String(st.str("session_id").prefix(8)), key: "version"))
         }
+        if let c = callRow { out.cells.append(c) }
 
         // l2 plus the keep-awake tail has to stay within the width of "● remote-control" (17 chars at this size).
         // "off · +1": off here, but another session's remote-control still keeps the Mac awake
@@ -519,6 +553,9 @@ func render(_ snap: Snapshot, mode: Mode) -> Render {
             if rcOn < snap.sessions.count { out.actions.append(Action(command: "rc-all-on", label: "all on", local: true)) }
             if rcOn > 0 { out.actions.append(Action(command: "rc-all-off", label: "all off", local: true)) }
             out.actions.append(Action(command: "allow-sleep", label: snap.allowSleep ? "keep awake" : "allow sleep", local: true))
+        }
+        if key == "call" && !snap.call.isEmpty {
+            out.actions = [Action(command: snap.call == "off" ? "call-on" : "call-off", label: snap.call == "off" ? "turn on" : "turn off", local: true)]
         }
     }
     out.rc.key = "rc"
@@ -577,6 +614,9 @@ func helpText(for key: String, shell: ShellJob?) -> Help {
         return Help(l1: "Remote Control です。on のセッションは claude.ai やスマホアプリから続きを操作できます。all on / all off で全セッションをまとめて切り替えます。",
                     l2: "on の間は蓋を閉じても寝ません（awake）。allow sleep で蓋を閉じたら寝るように（sleep）、電源をつなぐと元に戻ります。電池 15% 以下では解除。「off · +1」は他の 1 セッションが on。",
                     actions: [Action(command: "/remote-control")])
+    case "call":
+        return Help(l1: "Claude通話です。on の間、iPhone の Discord でサーバー「Claude通話」のボイスチャンネルに入ると、Mac の Claude Code と声で話せます。",
+                    l2: "standby=待機中 / in call=通話中 / working=頼まれた作業を裏で実行中。turn off で完全に止まり、次にログインしても off のままです。")
     case "nostate":
         return Help(l1: "このセッションはまだ statusline のデータを書き出していません。",
                     l2: "そのセッションで一度メッセージを送ると、コンテキストやモデルなどが表示されます。")
@@ -908,6 +948,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     var voice: (tty: String, pid: Int)?    // the session that is recording dictation
     var voiceBusy = false
     var rcBusy = false
+    var callBusy = false
     var hintSerial = 0
 
     // What the frontmost app calls for: a session's detail (Terminal tab running Claude),
@@ -1127,6 +1168,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
                 refresh()
             case "rc-all-on", "rc-all-off":
                 rcAll(on: a.command == "rc-all-on", button: b)
+            case "call-on", "call-off":
+                guard !callBusy else { return }
+                callBusy = true
+                b.title = "…"
+                let on = a.command == "call-on"
+                DispatchQueue.global(qos: .userInitiated).async {
+                    setCall(on: on)
+                    // the bot writes its status file a moment after it starts
+                    DispatchQueue.main.asyncAfter(deadline: .now() + (on ? 2.5 : 0.8)) {
+                        self.callBusy = false
+                        self.last.actions = []
+                        self.refresh()
+                    }
+                }
             default:
                 break
             }
